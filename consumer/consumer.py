@@ -154,12 +154,39 @@ async def process_message(msg, pg_pool, redis_client, model):
     msg_partition = msg.partition()
     msg_offset    = msg.offset()
 
+    # Extract ground truth if present (Kaggle replay mode only — for accuracy logging)
+    ground_truth = tx.pop("_ground_truth", None)
+
+    # Build features — model.py handles both kaggle and synthetic formats
     cat = tx.get("category", "misc_net")
     cat_mean, cat_std = CATEGORY_STATS.get(cat, (100.0, 100.0))
     velocity = await get_velocity(redis_client, tx.get("cc_num", ""))
+
+    # Pass full tx to features — includes V1-V28 if kaggle mode
     features = compute_features_dict(tx, velocity, cat_mean, cat_std)
 
+    # Also pass raw V1-V28 fields directly for kaggle model
+    for i in range(1, 29):
+        k = f"V{i}"
+        if k in tx:
+            features[k] = float(tx[k])
+    if "Amount" in tx:
+        features["Amount_scaled"] = float(tx["Amount"]) / 1000.0
+    if "Time" in tx:
+        features["Time_scaled"] = float(tx["Time"]) / 172800.0
+
     prediction = model.predict(features)
+
+    # Log accuracy when ground truth is available (Kaggle replay mode)
+    if ground_truth is not None:
+        correct = (prediction["is_fraud"] == bool(ground_truth))
+        match   = "✓ CORRECT" if correct else "✗ WRONG  "
+        if ground_truth == 1 or not correct:
+            log.info("ACCURACY %s | predicted=%s actual=%s score=%.3f",
+                     match,
+                     "FRAUD" if prediction["is_fraud"] else "LEGIT",
+                     "FRAUD" if ground_truth == 1 else "LEGIT",
+                     prediction["fraud_score"])
 
     try:
         from explainer import explain_async, _rule_based_explanation

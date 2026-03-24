@@ -1,9 +1,12 @@
 """
-producer.py — Kafka credit card transaction producer.
+producer.py — Kafka transaction producer.
 
-Replaces the original Scala Kafka producer. Streams realistic synthetic
-transactions into the `creditcard.transactions` topic at configurable rate.
-Supports replay from CSV (for training) and live generation.
+Supports two modes:
+  live   — generates synthetic transactions (Phase 1)
+  kaggle — replays real Kaggle creditcard.csv rows as live transactions
+            (strips the Class label so consumer must predict it)
+            This is Phase 2: the model scores transactions that actually
+            came from the same distribution it was trained on.
 """
 
 import os
@@ -14,17 +17,11 @@ import signal
 import logging
 import random
 import sys
+import uuid
 from pathlib import Path
+from datetime import datetime, timezone
 
 from confluent_kafka import Producer, KafkaException
-from generator import Customer, generate_customers, generate_transaction, to_kafka_message
-
-# ─── Config ───────────────────────────────────────────────────────────────────
-KAFKA_BOOTSTRAP  = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
-KAFKA_TOPIC      = os.getenv("KAFKA_TOPIC", "creditcard.transactions")
-INTERVAL_MS      = int(os.getenv("STREAM_INTERVAL_MS", "2000"))
-DATA_DIR         = Path(os.getenv("DATA_DIR", "/app/data"))
-MODE             = os.getenv("PRODUCER_MODE", "live")   # live | replay
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,114 +30,156 @@ logging.basicConfig(
 )
 log = logging.getLogger("producer")
 
-# ─── Kafka producer config ────────────────────────────────────────────────────
-PRODUCER_CONFIG = {
+KAFKA_BOOTSTRAP  = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+KAFKA_TOPIC      = os.getenv("KAFKA_TOPIC", "creditcard.transactions")
+INTERVAL_MS      = int(os.getenv("STREAM_INTERVAL_MS", "2000"))
+DATA_DIR         = Path(os.getenv("DATA_DIR", "/app/data"))
+MODE             = os.getenv("PRODUCER_MODE", "live")
+
+PRODUCER_CONFIG  = {
     "bootstrap.servers": KAFKA_BOOTSTRAP,
-    "acks": "all",                     # wait for all replicas
-    "retries": 5,
-    "retry.backoff.ms": 500,
-    "linger.ms": 10,                   # micro-batching for throughput
-    "compression.type": "lz4",
-    "enable.idempotence": True,        # exactly-once production
+    "acks":              "all",
+    "retries":           5,
+    "linger.ms":         10,
+    "compression.type":  "lz4",
+    "enable.idempotence": True,
 }
 
 running = True
 
+# Synthetic merchant names for display (Kaggle has no merchant info)
+MERCHANTS = [
+    "Amazon", "Walmart", "Shell Gas", "Delta Airlines", "Netflix",
+    "Starbucks", "Apple Store", "Uber", "McDonald's", "Target",
+    "Crypto Exchange Pro", "Unknown Merchant", "PayQuick Transfer",
+    "Luxury Watches Ltd", "International Wire Co",
+]
+CATEGORIES = [
+    "shopping_net", "grocery_pos", "gas_transport", "travel",
+    "entertainment", "food_dining", "shopping_pos", "misc_net",
+]
+
+
 def _delivery_report(err, msg):
     if err:
-        log.error("Delivery failed | topic=%s partition=%d offset=%d err=%s",
-                  msg.topic(), msg.partition(), msg.offset(), err)
-    else:
-        log.debug("Delivered | partition=%d offset=%d key=%s",
-                  msg.partition(), msg.offset(), msg.key())
+        log.error("Delivery failed: %s", err)
 
 
-def _partition_key(tx_dict: dict) -> bytes:
-    """Partition by cc_num so all transactions for a card go to the same partition."""
-    return tx_dict["cc_num"].encode()
+# ─── Mode 1: Kaggle replay ────────────────────────────────────────────────────
 
-
-def load_customers_from_csv() -> list[Customer]:
-    path = DATA_DIR / "customers.csv"
-    if not path.exists():
-        log.warning("customers.csv not found — generating synthetic customers")
-        customers = generate_customers(100)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["cc_num","first","last","gender","street","city",
-                             "state","zip","lat","long","job","dob"])
-            for c in customers:
-                writer.writerow([c.cc_num, c.first, c.last, c.gender, c.street,
-                                 c.city, c.state, c.zip, c.lat, c.long, c.job, c.dob])
-        return customers
-
-    customers = []
+def load_kaggle_rows(path: Path) -> list[dict]:
+    """Load all rows from creditcard.csv into memory, strip Class label."""
+    log.info("Loading Kaggle dataset from %s ...", path)
+    rows = []
     with open(path) as f:
         reader = csv.DictReader(f)
         for row in reader:
-            customers.append(Customer(
-                cc_num=row["cc_num"], first=row["first"], last=row["last"],
-                gender=row["gender"], street=row["street"], city=row["city"],
-                state=row["state"], zip=row["zip"],
-                lat=float(row["lat"]), long=float(row["long"]),
-                job=row["job"], dob=row["dob"],
-            ))
-    log.info("Loaded %d customers from CSV", len(customers))
-    return customers
+            # Strip the label — consumer must predict it
+            # Keep it internally only for ground-truth logging
+            rows.append(row)
+    log.info("Loaded %d Kaggle transactions", len(rows))
+    return rows
 
 
-def replay_from_csv(producer: Producer, customers: list[Customer]):
-    """Replay transactions from the testing CSV (mirrors original Kafka producer behaviour)."""
-    path = DATA_DIR / "transactions_testing.csv"
-    if not path.exists():
-        log.error("transactions_testing.csv not found — falling back to live mode")
-        return live_stream(producer, customers)
+def kaggle_stream(producer: Producer, rows: list[dict]):
+    """
+    Replay Kaggle rows as live transactions.
+    Adds a fresh timestamp and transaction ID each time.
+    Shuffles so fraud is distributed throughout the stream.
+    """
+    log.info("Starting Kaggle replay stream → topic=%s interval=%dms",
+             KAFKA_TOPIC, INTERVAL_MS)
 
-    with open(path) as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
+    # Shuffle once so fraud cases are spread out, not all at end
+    shuffled = rows.copy()
+    random.shuffle(shuffled)
 
-    log.info("Replaying %d transactions from CSV", len(rows))
-    for row in rows:
-        if not running:
-            break
-        # Build a message matching live schema (without is_fraud label for inference)
-        msg = {k: v for k, v in row.items() if k != "is_fraud"}
+    sent = fraud_sent = 0
+
+    while running:
+        # Loop back to start when exhausted
+        if sent >= len(shuffled):
+            random.shuffle(shuffled)
+            sent = 0
+            log.info("Replay loop complete — reshuffling and restarting")
+
+        row = shuffled[sent]
+
+        # Build the message — V1-V28 + Amount + Time + metadata
+        # Strip Class label (ground truth) from the Kafka message
+        ground_truth = int(float(row.get("Class", 0)))
+
+        msg = {
+            "trans_num":  uuid.uuid4().hex[:20].upper(),
+            "trans_time": datetime.now(timezone.utc).isoformat(),
+            # Kaggle PCA features
+            **{f"V{i}": float(row[f"V{i}"]) for i in range(1, 29)},
+            "Amount":     float(row["Amount"]),
+            "Time":       float(row["Time"]),
+            # Synthetic display fields (not used by model, just for dashboard UI)
+            "cc_num":     str(random.randint(1000000000000000, 9999999999999999)),
+            "merchant":   random.choice(MERCHANTS),
+            "category":   random.choice(CATEGORIES),
+            "amt":        float(row["Amount"]),   # alias for dashboard display
+            "cust_lat":   round(random.uniform(35.0, 52.0), 6),
+            "cust_long":  round(random.uniform(-120.0, -70.0), 6),
+            "merch_lat":  round(random.uniform(35.0, 52.0), 6),
+            "merch_long": round(random.uniform(-120.0, -70.0), 6),
+            "dob":        "1985-06-15",
+            # Include ground truth ONLY for accuracy tracking (consumer logs it but doesn't use it for prediction)
+            "_ground_truth": ground_truth,
+        }
+
         producer.produce(
             topic=KAFKA_TOPIC,
-            key=row["cc_num"].encode(),
+            key=msg["cc_num"].encode(),
             value=json.dumps(msg).encode(),
             callback=_delivery_report,
         )
         producer.poll(0)
+
+        sent += 1
+        if ground_truth == 1:
+            fraud_sent += 1
+
+        if sent % 100 == 0:
+            log.info("Streamed %d transactions (%d fraud, %.2f%%)",
+                     sent, fraud_sent, fraud_sent / sent * 100)
+
         time.sleep(INTERVAL_MS / 1000)
 
-    producer.flush()
-    log.info("Replay complete")
+    producer.flush(timeout=10)
+    log.info("Kaggle stream ended after %d messages", sent)
 
 
-def live_stream(producer: Producer, customers: list[Customer]):
-    """Continuously generate and produce live synthetic transactions."""
-    log.info("Starting live transaction stream → topic=%s interval=%dms",
+# ─── Mode 2: Synthetic live generation ───────────────────────────────────────
+
+def live_stream(producer: Producer):
+    """Original synthetic transaction generator (Phase 1 fallback)."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    from generator import generate_customers, generate_transaction, to_kafka_message
+
+    customers = generate_customers(100)
+    log.info("Starting live synthetic stream → topic=%s interval=%dms",
              KAFKA_TOPIC, INTERVAL_MS)
+
     sent = 0
     while running:
         customer = random.choice(customers)
-        tx = generate_transaction(customer)
-        msg = to_kafka_message(tx, include_label=False)
+        tx       = generate_transaction(customer)
+        msg      = to_kafka_message(tx, include_label=False)
 
         producer.produce(
             topic=KAFKA_TOPIC,
-            key=_partition_key(json.loads(msg)),
+            key=tx.cc_num.encode(),
             value=msg.encode(),
             callback=_delivery_report,
         )
-        producer.poll(0)   # trigger delivery callbacks
+        producer.poll(0)
         sent += 1
 
         if sent % 100 == 0:
-            log.info("Produced %d transactions", sent)
+            log.info("Produced %d synthetic transactions", sent)
 
         time.sleep(INTERVAL_MS / 1000)
 
@@ -148,26 +187,32 @@ def live_stream(producer: Producer, customers: list[Customer]):
     log.info("Producer shut down after %d messages", sent)
 
 
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
     global running
 
     def _shutdown(sig, frame):
         global running
-        log.info("Received signal %s — shutting down", sig)
+        log.info("Shutting down producer...")
         running = False
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    customers = load_customers_from_csv()
     producer = Producer(PRODUCER_CONFIG)
+    log.info("Kafka producer connected → %s | mode=%s", KAFKA_BOOTSTRAP, MODE)
 
-    log.info("Kafka producer connected → %s", KAFKA_BOOTSTRAP)
-
-    if MODE == "replay":
-        replay_from_csv(producer, customers)
+    if MODE == "kaggle":
+        kaggle_path = DATA_DIR / "creditcard.csv"
+        if not kaggle_path.exists():
+            log.warning("creditcard.csv not found — falling back to synthetic mode")
+            live_stream(producer)
+        else:
+            rows = load_kaggle_rows(kaggle_path)
+            kaggle_stream(producer, rows)
     else:
-        live_stream(producer, customers)
+        live_stream(producer)
 
 
 if __name__ == "__main__":
