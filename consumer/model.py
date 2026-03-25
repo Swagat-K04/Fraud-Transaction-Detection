@@ -91,7 +91,15 @@ class FraudModel:
         log.info("Loaded XGBoost model from %s", MODEL_PATH)
         return True
 
-    def predict(self, features: dict) -> dict:
+    def predict(self, features: dict, threshold: float = 0.5) -> dict:
+        """
+        Run prediction with a configurable decision threshold.
+
+        threshold: float between 0.1-0.9
+          Lower  → catch more fraud, more false positives
+          Higher → fewer false positives, miss more fraud
+          Default 0.5 is neutral; tune based on business needs
+        """
         if self._booster is None:
             raise RuntimeError("Model not loaded")
 
@@ -114,8 +122,9 @@ class FraudModel:
 
         return {
             "fraud_score":  round(score, 4),
-            "is_fraud":     score >= 0.5,
-            "risk_level":   _risk_level(score),
+            "is_fraud":     score >= threshold,          # ← threshold applied here
+            "risk_level":   _risk_level(score),          # risk level stays score-based
+            "threshold":    round(threshold, 2),
             "top_features": top_features,
         }
 

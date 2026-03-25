@@ -136,7 +136,7 @@ export function FeedPanel({ transactions, onSelectTx }) {
           </div>
         ) : (
           visible.map(tx => (
-            <TxCard key={tx.trans_num} tx={tx} onSelect={onSelectTx} />
+            <TxCard key={`${tx.trans_num}-${tx.trans_time}`} tx={tx} onSelect={onSelectTx} />
           ))
         )}
       </div>

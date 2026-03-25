@@ -23,6 +23,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from routes.transactions import router as tx_router
 from routes.customers import router as cust_router
 from routes.stats import router as stats_router
+from routes.threshold import router as threshold_router
+from routes.inject import router as inject_router
 from db import Database
 
 log = logging.getLogger("api")
@@ -65,7 +67,7 @@ manager = ConnectionManager()
 async def redis_subscriber(redis_client: aioredis.Redis):
     """Subscribe to Redis channels and broadcast to all connected WebSocket clients."""
     pubsub = redis_client.pubsub()
-    await pubsub.subscribe("tx.all", "fraud.alerts")
+    await pubsub.subscribe("tx.all", "fraud.alerts", "threshold.changed")
     log.info("Redis subscriber started — listening on tx.all, fraud.alerts")
 
     async for message in pubsub.listen():
@@ -120,6 +122,8 @@ app.add_middleware(
 app.include_router(tx_router,   prefix="/api")
 app.include_router(cust_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
+app.include_router(threshold_router, prefix="/api")
+app.include_router(inject_router, prefix="/api")
 
 
 @app.get("/health")

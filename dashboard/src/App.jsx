@@ -1,13 +1,19 @@
-import { useState, useCallback, useRef } from 'react'
-import { useWebSocket } from './hooks/useWebSocket'
-import { StatsBar }      from './components/StatsBar'
-import { RiskChart }     from './components/RiskChart'
-import { FeedPanel }     from './components/FeedPanel'
-import { FraudAlerts }   from './components/FraudAlerts'
-import { CustomerDrawer } from './components/CustomerDrawer'
+import { useState, useCallback, useRef, useEffect } from 'react'
+import { useWebSocket }     from './hooks/useWebSocket'
+import { StatsBar }         from './components/StatsBar'
+import { RiskChart }        from './components/RiskChart'
+import { FeedPanel }        from './components/FeedPanel'
+import { FraudAlerts }      from './components/FraudAlerts'
+import { CustomerDrawer }   from './components/CustomerDrawer'
+import { ThresholdPanel }   from './components/ThresholdPanel'
 
-const MAX_FEED    = 200   // cap in-memory feed length
-const MAX_ALERTS  = 50
+const MAX_FEED   = 200
+const MAX_ALERTS = 50
+
+const SIDE_TABS = [
+  { key: 'alerts',    label: '🚨 Alerts' },
+  { key: 'threshold', label: '⚙️ Threshold' },
+]
 
 export default function App() {
   const [transactions, setTransactions] = useState([])
@@ -15,14 +21,32 @@ export default function App() {
   const [selectedTx,   setSelectedTx]   = useState(null)
   const [liveCount,    setLiveCount]    = useState(0)
   const [paused,       setPaused]       = useState(false)
+  const [sideTab,      setSideTab]      = useState('alerts')
+  const [activeThreshold, setActiveThreshold] = useState(0.5)
+  const [injecting, setInjecting] = useState(false)
+  const [injectResult, setInjectResult] = useState(null)
+  const [injectScenario, setInjectScenario] = useState(0)
+
+  // Fetch active threshold from API on mount
+  useEffect(() => {
+    fetch((import.meta.env.VITE_API_URL || 'http://localhost:8000') + '/api/threshold')
+      .then(r => r.json())
+      .then(d => { if (d?.threshold != null) setActiveThreshold(d.threshold) })
+      .catch(() => {})
+  }, [])
   const pausedRef = useRef(false)
 
   const { connected } = useWebSocket(useCallback((msg) => {
+    // Handle threshold change broadcast from Redis
+    if (msg.threshold !== undefined && msg.trans_num === undefined) {
+      setActiveThreshold(msg.threshold)
+      return
+    }
+
     if (pausedRef.current) return
 
     const tx = {
       ...msg,
-      // Preserve full cc_num for customer lookup, show masked in UI
       cc_num_full: msg.cc_num,
       cc_num: msg.cc_num?.slice(-4) || '????',
     }
@@ -32,8 +56,29 @@ export default function App() {
 
     if (tx.is_fraud) {
       setAlerts(prev => [tx, ...prev].slice(0, MAX_ALERTS))
+      // Auto-switch to alerts tab when new fraud detected
+      setSideTab('alerts')
     }
   }, []))
+
+  const injectFraud = async () => {
+    setInjecting(true)
+    setInjectResult(null)
+    try {
+      const res = await fetch(
+        (import.meta.env.VITE_API_URL || 'http://localhost:8000') + '/api/inject/fraud',
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scenario: injectScenario }) }
+      )
+      const data = await res.json()
+      setInjectResult(data)
+      setSideTab('alerts')
+      setTimeout(() => setInjectResult(null), 5000)
+    } catch (e) {
+      setInjectResult({ success: false, message: 'Failed: ' + e.message })
+    } finally {
+      setInjecting(false)
+    }
+  }
 
   const togglePause = () => {
     pausedRef.current = !pausedRef.current
@@ -66,6 +111,11 @@ export default function App() {
             <div className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-green-400 pulse-dot' : 'bg-gray-600'}`} />
             {connected ? 'LIVE' : 'CONNECTING'}
           </div>
+          {/* Active threshold badge */}
+          <div className="flex items-center gap-1.5 font-mono text-[11px] px-2 py-1
+            rounded-full border border-blue-800/50 text-blue-400 bg-blue-950/30">
+            ⚙ threshold: {activeThreshold?.toFixed(2) ?? '…'}
+          </div>
         </div>
 
         <div className="flex items-center gap-2">
@@ -78,6 +128,25 @@ export default function App() {
               border-gray-700 hover:border-gray-600 text-gray-300 hover:text-white transition-colors"
           >
             {paused ? '▶ Resume' : '⏸ Pause'}
+          </button>
+          <select
+            value={injectScenario}
+            onChange={e => setInjectScenario(Number(e.target.value))}
+            className="font-mono text-xs px-2 py-1.5 rounded-lg border
+              border-gray-700 bg-gray-900 text-gray-400"
+          >
+            <option value={0}>Card-not-present</option>
+            <option value={1}>Velocity fraud</option>
+            <option value={2}>Geographic anomaly</option>
+          </select>
+          <button
+            onClick={injectFraud}
+            disabled={injecting}
+            className="font-mono text-xs px-3 py-1.5 rounded-lg border
+              border-red-800/60 hover:border-red-500 text-red-400 hover:text-red-300
+              disabled:opacity-50 transition-colors"
+          >
+            {injecting ? '⏳ Injecting…' : '🧪 Inject Fraud'}
           </button>
           <button
             onClick={clearAll}
@@ -99,7 +168,7 @@ export default function App() {
         <RiskChart liveCount={liveCount} />
       </div>
 
-      {/* ── Main content — 3-column grid ───────────────────────────── */}
+      {/* ── Main 3-column grid ─────────────────────────────────────── */}
       <div className="flex-1 min-h-0 grid grid-cols-12 gap-3 px-4 pb-4">
 
         {/* Live feed — 7 cols */}
@@ -110,9 +179,32 @@ export default function App() {
           />
         </div>
 
-        {/* Fraud alerts — 5 cols */}
-        <div className="col-span-5 card p-3 overflow-hidden flex flex-col">
-          <FraudAlerts alerts={alerts} />
+        {/* Right panel — 5 cols with tabs */}
+        <div className="col-span-5 card overflow-hidden flex flex-col">
+          {/* Tab bar */}
+          <div className="flex border-b border-gray-800 flex-shrink-0">
+            {SIDE_TABS.map(tab => (
+              <button
+                key={tab.key}
+                onClick={() => setSideTab(tab.key)}
+                className={`flex-1 py-2.5 font-mono text-xs transition-colors
+                  ${sideTab === tab.key
+                    ? 'text-gray-100 border-b-2 border-blue-500 bg-gray-900/50'
+                    : 'text-gray-500 hover:text-gray-300'
+                  }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Tab content */}
+          <div className="flex-1 overflow-y-auto p-3">
+            {sideTab === 'alerts' && <FraudAlerts alerts={alerts} />}
+            {sideTab === 'threshold' && (
+              <ThresholdPanel onThresholdChange={setActiveThreshold} />
+            )}
+          </div>
         </div>
       </div>
 

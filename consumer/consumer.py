@@ -16,6 +16,7 @@ from confluent_kafka import Consumer, KafkaError
 
 from features import compute_features_dict
 from model import get_model
+from threshold import get_threshold, init_threshold
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 KAFKA_TOPIC     = os.getenv("KAFKA_TOPIC", "creditcard.transactions")
@@ -142,6 +143,8 @@ async def publish_to_redis(redis_client, tx, prediction, reasoning):
     channel = "fraud.alerts" if prediction["is_fraud"] else "tx.stream"
     await redis_client.publish(channel, payload)
     await redis_client.publish("tx.all", payload)
+    # Include threshold in payload so dashboard knows what threshold was used
+    
 
 
 async def process_message(msg, pg_pool, redis_client, model):
@@ -175,7 +178,9 @@ async def process_message(msg, pg_pool, redis_client, model):
     if "Time" in tx:
         features["Time_scaled"] = float(tx["Time"]) / 172800.0
 
-    prediction = model.predict(features)
+    # Read live threshold from Redis (cached, refreshes every 10 txns)
+    threshold  = await get_threshold(redis_client)
+    prediction = model.predict(features, threshold=threshold)
 
     # Log accuracy when ground truth is available (Kaggle replay mode)
     if ground_truth is not None:
@@ -228,6 +233,7 @@ async def main_async():
         min_size=2, max_size=10, command_timeout=15
     )
     redis_client = await aioredis.from_url(REDIS_URL, decode_responses=True)
+    await init_threshold(redis_client)
 
     kafka_conf = {
         "bootstrap.servers":  KAFKA_BOOTSTRAP,
